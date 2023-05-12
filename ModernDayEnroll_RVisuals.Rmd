@@ -1,0 +1,781 @@
+---
+title: "Data Mining Final Project"
+author: "Jennie Franco"
+date: "10/9/2022"
+output: html_document
+---
+
+##FINAL PROJECT
+##-----------
+## 1 Business Understanding
+
+Load Libraries
+```{r}
+library(pacman)
+p_load(xgboost, readxl, ada, fastDummies, tidyverse, vtable, ROCR, Matrix, caret, stringr, car, lubridate, janitor, corrplot, mice, reshape, ggplot2, GGally)
+```
+
+
+## 2 Data Understanding 
+```{r}
+# Import household 1 dataset
+h1 <- read_excel("households_1.xlsx") %>% mutate(across(where(is.character), as.factor)) %>% clean_names()
+
+# Import household 2 dataset
+h2 <- read_excel("households_2_sol.xlsx") %>% mutate(across(where(is.character), as.factor)) %>% clean_names()
+
+# Import household 3 dataset
+h3 <- read_excel("households_3.xlsx") %>% mutate(across(where(is.character), as.factor)) %>% clean_names()
+
+# View data
+str(h1)
+sumtable(h1)
+
+# View data household2
+str(h1)
+sumtable(h2)
+
+# View data household 3
+str(h3)
+sumtable(h3)
+```
+
+## 3 Data Preparation
+In this section we will be doing some exploratory data analysis to have a better understanding of the data we are working with.
+
+### 3.1 Explore Data
+```{r}
+# Histogram & Box plots
+gathered_h1 <- h1 %>% select(-prevhome, -downpct, -dwnpay) %>% gather()
+gathered_h1 %>% ggplot(aes(x=value)) + geom_histogram() + facet_wrap(~key, scales='free')
+gathered_h1 %>% ggplot(aes(y=value)) + geom_boxplot() + facet_wrap(~key, scales='free')
+```
+From the plots I see some inaccuracies with the household 1 data:
+
+    * age: there are values like 1985 - 16 like this in total
+    * purchdate: saw some homes with year of 6  or less - 4 observations like this
+
+
+
+### 3.2 Missing Data
+```{r}
+# Household 1
+print("Count of total missing values in h1 - ")
+sum(is.na(h1))
+
+#Household 2
+print("Count of total missing values in h2 - ")
+sum(is.na(h2))
+
+#Household 3
+print("Count of total missing values in h2 - ")
+sum(is.na(h3))
+```
+
+Which features are missing data?
+```{r}
+sapply(h1, function(x) sum(is.na(x)))
+sapply(h2, function(x) sum(is.na(x)))
+```
+For both household 1 & 2 the same features are missing data. We will have to clean this before we do our modeling. 
+
+### 3.3 Join Datasets
+Let's join the two data frames (h1 and h2) and check the distribution of our classes before we dive into data cleaning.
+```{r}
+# Add an id column in h1
+h1 <- h1 %>% mutate(id = row_number())
+
+# Left join h1 with h2
+all <- rbind(h1,h2)
+
+all %>% glimpse()
+```
+### 3.4 Class Distribution
+```{r}
+# Class Distribution for H1
+barplot(prop.table(table(h1$hi_educ_inc)),
+        col = rainbow(2),
+        ylim = c(0, 1.0),
+        main = "Class Distribution for H1") 
+
+# Class Distribution for H2
+barplot(prop.table(table(h2$hi_educ_inc)),
+        col = rainbow(2),
+        ylim = c(0, 1.0),
+        main = "Class Distribution for H2") 
+
+# Class Distribution for Joined Data (all)
+barplot(prop.table(table(all$hi_educ_inc)),
+        col = rainbow(2),
+        ylim = c(0, 1.0),
+        main = "Class Distribution for Joined Data") 
+```
+It is clearly evident that around 85% of the data is in class 0 and the remaining 15% is in another class. When we run our models, we may get fewer True Positives and more False Negatives than we would like because of the imbalance. We will need to restructure our data to deal with the class imbalance. More to come on this later.
+
+### 3.5 Visualizations
+Running a function here for the plots. This way I don't get too many objects in the global environment. 
+```{r}
+# Change the data variable in the function to whatever dataset you want.
+correlation_function <- function(data = all){
+    
+    # convert data to numeric to run correlations
+    cor_num <- select_if(data, is.numeric)
+    
+    # calculate correlations
+    correlation <- cor(na.omit(cor_num))
+    
+    # plot correlations
+    corrplot(correlation, method = 'square', is.corr=FALSE, tl.cex = 0.7, tl.col="black",
+             na.label=" ")
+}
+
+correlation_function()
+```
+From the correlations, we can see that there is high correlation between the very low, low and medium income. Also between beds and rooms. As for our predictor (hi_educ_inc) it is mostly correlated with number of kids. Let's do some further investigation.
+
+
+Another correlation plot for smaller subsets is shown below for the joined data.
+```{r}
+
+corrDemographic <- function(data = all, seed = 555){
+    
+    # Demographic Data
+    s1 <- data %>% select(hi_educ_inc, age, gender, married, nkid, natvty, race, span, cars)
+    m1 <- cor(na.omit(s1))
+    
+    mplot1 <- melt(m1)
+    mplot1 <- mplot1 %>% mutate_if(is.numeric, round, digits =2)
+    colnames(mplot1) <- c("x", "y", "value")
+    ggplot(mplot1, aes(x = x, y = y, fill = value)) +
+    geom_tile(color = "white", lwd = 0.5, linetype =1 ) +
+    geom_text(aes(label = value), color = "white", size = 3) +
+    theme(axis.text.x = element_text(angle = 90, hjust =1)) +
+    coord_fixed() +
+    labs(title = "Demographic Data")
+}
+
+corrLocation <- function(data = all, seed = 111){
+    
+    # Location Data
+    s2 <- data %>% select(hi_educ_inc, region, unit_rating, nbhd_rating, very_lo_inc, 
+                                         lo_inc, median_inc)
+    m2 <- cor(na.omit(s2))
+    
+    mplot2 <- melt(m2)
+    mplot2 <- mplot2 %>% mutate_if(is.numeric, round, digits =2)
+    colnames(mplot2) <- c("x", "y", "value")
+    ggplot(mplot2, aes(x = x, y = y, fill = value)) +
+    geom_tile(color = "white", lwd = 0.5, linetype = 1) +
+    geom_text(aes(label = value), color = "white", size = 3) +
+    theme(axis.text.x = element_text(angle = 90, hjust =1)) +
+    coord_fixed() +
+    labs(title = "Location Data")
+}
+
+corrDewlling <- function(data = all, seed = 222){
+    
+    # Dwelling Data
+    s3 <- data %>% select(hi_educ_inc, bath, bed, built, floors, condo, garage, lot, 
+                                          psewer, rooms, sqft, value)
+    m3 <- cor(na.omit(s3))
+    
+    mplot3 <- melt(m3)
+    mplot3 <- mplot3 %>% mutate_if(is.numeric, round, digits =2)
+    colnames(mplot3) <- c("x", "y", "value")
+    ggplot(mplot3, aes(x = x, y = y, fill = value)) +
+    geom_tile(color = "white", lwd = 0.5, linetype = 1) +
+    geom_text(aes(label = value), color = "white", size = 3) +
+    theme(axis.text.x = element_text(angle = 90, hjust =1)) +
+    coord_fixed() +
+    labs(title = "Dwelling Data")
+    
+}
+
+corrMortgage <- function(data = all, seed = 333){
+    
+    # Mortgage Data
+    s4 <- data %>% select(hi_educ_inc, helc, helump, purchdate)
+    m4 <- cor(na.omit(s4))
+    
+    mplot4 <- melt(m4)
+    mplot4 <- mplot4 %>% mutate_if(is.numeric, round, digits =2)
+    colnames(mplot4) <- c("x", "y", "value")
+    ggplot(mplot4, aes(x = x, y = y, fill = value)) +
+    geom_tile(color = "white", lwd = 0.5, linetype = 1) +
+    geom_text(aes(label = value), color = "white", size = 3) +
+    theme(axis.text.x = element_text(angle = 90, hjust =1)) +
+    coord_fixed() +
+    labs(title = "Mortgage Data")
+    
+}
+
+corrDemographic()
+corrLocation()
+corrDewlling()
+corrMortgage()
+```
+Again, we same the results as with the correlation plot of H1. Here we can clearly see that low income & very low income are highly correlated (0.98). We will need to remove one of these attributes to avoid multicollinearity.
+
+
+## 4 Data Cleaning
+To preserve the rest of the features' data, I'm going to replace the outliers with NAs here.
+In addition, I'd like to address the missing values. In our combined dataset, there are 9 features with missing values. Missing values can introduce bias and affect the efficiency of how our models perform.
+
+I chose not to eliminate the missing entries because doing so would significantly reduce the size of our dataset. I also avoid using the mean or mode for NAs because it skews my data. I selected to impute data using classification and regression trees based on an earlier study with Household1 and Household2 data.
+
+To illustrate the relationships between variables, I also plot a correlation matrix of our wrangled data once it has been cleaned and missing values have been dealt with.
+
+The procedure for data imputation is as follows:
+    1. Fit a classification or regression tree by recursive partitioning;
+    2. For each ymis, find the terminal node they end up according to the fitted tree;
+    3. Make a random draw among the member in the node, and take the observed value from that 
+    draw as the imputation.
+
+    * resource: https://www.rdocumentation.org/packages/mice/versions/3.14.0/topics/mice.impute.cart
+
+```{r}
+# Read & clean data function
+
+ all_data_wrangled <- function(data = all, seed = 2022){ # change data here to h3 for example to test
+   
+  # clean column names
+  data <- data %>% clean_names()
+  
+  # clean the dataset
+  data$age[which(data$age > 100)] <- NA
+  
+  # get the min for the purchase date and convert to NA if below
+  min <- quantile(data$purchdate, 0.0004, na.rm = TRUE)
+  data$purchdate[which(data$purchdate < min)] <- NA
+
+  # convert data to numeric to run correlations
+  cor_num <- select_if(data, is.numeric)
+ 
+  # calculate correlations
+  correlations <- cor(na.omit(cor_num))
+  
+  # plot correlations
+  corrplot(correlations, method = 'square', is.corr=FALSE, tl.cex = 0.7, tl.col="black", na.label=" ")
+  
+  
+  # impute missing data
+  set.seed(seed)
+  
+  imp_all <- mice(data, method = "cart", m = 1) # Impute data
+  imp_data <- complete(imp_all) # Store data 
+
+  summary(imp_data)
+  
+  # convert to a dataframe 
+  new_data <- as.data.frame(imp_data)
+  
+} 
+
+all_wrangled <- all_data_wrangled()
+```
+
+
+## 6 Variable Selection
+```{r}
+# Possible look at variable selection 
+all_wrangled %>% group_by(hi_educ_inc) %>% summarize_all(mean)
+```
+Conclusion: variable selection - age, married, nkid, natvty, very lo inc, lo inc, median inc, bath, floors, lot, rooms, sqft, value, purchdate
+
+
+### 6.1 Dropping Variables
+Here, I am dropping highly correlated variables. 
+```{r}
+# Variables with high correlations - very lo income and lo income 
+drop_vars <- c('lo_inc')
+all_wrangled <- all_wrangled[,!(names(all_wrangled) %in% drop_vars)]
+```
+
+Reshape data for modeling
+```{r}
+# Reshape the dataset for modeling 
+all_wrangled$hi_educ_inc <- factor(ifelse(all_wrangled$hi_educ_inc=="0", "No", "Yes"))
+```
+
+Split Data (80/20)
+```{r}
+# Randomly shuffle data
+nrows <- NROW(all_wrangled)
+set.seed(10)
+index <- sample(1:nrows, 0.8 * nrows)
+
+#Split data into 80/30
+train <- all_wrangled[index,]
+test <- all_wrangled[-index,]
+```
+
+Check proportion of predictor variable in train set
+```{r}
+prop.table(table(train$hi_educ_inc)) #Proportion of NO and Yes
+```
+Again, we are reminded that there is class imbalance in our data. 88% in one class and 12% in another class. We still have to deal with this. 
+
+
+## 7 Data Modeling
+
+### 7.1 CTree
+```{r}
+getAUC <- function(predictions, targets){
+  pred1 <- ROCR::prediction(predictions, targets)
+  perf1 <- ROCR::performance(pred1, "tpr", "fpr")
+  plot(perf1)
+  abline(0,1)
+  AUC <- performance(pred1, "auc")@y.values[1]
+}
+
+targets <- test$hi_educ_inc
+```
+
+```{r}
+# Classification tree
+set.seed(123)
+library(rpart.plot)
+treeControl = trainControl(classProbs = T,
+                           method="cv",
+                           number=5,
+                           summaryFunction = twoClassSummary)
+
+
+ct <- train %>% train(
+  hi_educ_inc ~ .,
+  data = .,
+  method="rpart", 
+  metric="ROC",
+  trControl = treeControl,
+  tuneLength = 10
+)
+
+print(ct)
+
+#Plot tree
+rpart.plot(ct$finalModel,type=1)
+
+treePred <- predict(ct, newdata=test, type="prob")[,2]
+treeAUC <- getAUC(treePred, targets)
+treeROC <- performance(prediction(treePred, targets),"tpr", "fpr")
+
+treeAUC
+
+varImp(ct)
+```
+
+### 7.2 RF
+```{r}
+# Random Forest
+set.seed(456)
+control <- trainControl(method='cv', 
+                        number=5)
+
+forest <- train %>% train(
+  hi_educ_inc ~ .,
+  data=.,
+  method="rf"
+)
+
+forest
+
+forestPred <- predict(forest, newdata = test, type="prob")[,2]
+forestAUC <- getAUC(forestPred, targets)
+forestROC <- performance(prediction(forestPred, targets), "tpr", "fpr")
+
+forestAUC 
+
+varImp(forest)
+```
+
+
+### 7.3 adaBoost
+```{r}
+fitControl <- trainControl(
+    method='cv',
+    classProbs = T                  # should class probabilities be returned
+) 
+
+set.seed(111)
+adaB <- train %>% caret::train(hi_educ_inc ~ .,
+                               data=.,
+                               method="ada",
+                               trControl = fitControl,
+                               tuneGrid = expand.grid(iter = c(3,6,9), maxdepth = c(2,4,6), 
+                                                      nu = c(0.1, 0.3, 0.5))
+)
+
+adaB
+
+adaPred <- predict(adaB, newdata = test, type = "prob")[,2]
+adaAUC <- getAUC(adaPred, targets)
+adaROC <- performance(prediction(adaPred, targets), "tpr", "fpr")
+
+adaAUC 
+```
+
+
+
+### 7.4 xgBoost
+```{r}
+set.seed(222)
+
+xgb_grid <- expand.grid(
+  nrounds = 50,
+  max_depth = 10,
+  eta = 0.3,
+  gamma=0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.5
+  )
+
+xgBoost <- train %>%
+  caret::train(hi_educ_inc ~ .,
+      data=.,
+      method = "xgbTree", 
+      tuneLength = 1
+)
+
+xgBoost
+
+xgbPred <- predict(xgBoost, newdata = test, type="prob")[,2]
+xgbAUC <- getAUC(xgbPred, targets)
+xgbROC <- performance(prediction(xgbPred, targets), "tpr", "fpr")
+
+xgbAUC
+
+varImp(xgBoost)
+```
+
+
+
+### 7.5 xgBoost Tuned
+```{r}
+set.seed(333)
+nrounds <- 500
+tune_grid <- expand.grid(
+  nrounds = 350,
+  eta = 0.025,
+  max_depth = 5,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = TRUE, # no training log
+  #classProbs = TRUE,
+  allowParallel = TRUE # FALSE for reproducible results 
+)
+
+xgb_tune <- train %>%
+  caret::train(hi_educ_inc ~ .,
+             data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+xgb_tune
+
+xgbTunePred <- predict(xgb_tune, newdata=test, type="prob")[,2]
+xgbTuneAUC <- getAUC(xgbTunePred, targets)
+xgbTuneROC <- performance(prediction(xgbTunePred, targets), "tpr", "fpr")
+
+xgbTuneAUC
+varImp(xgb_tune)
+```
+According to caret, the 'bestTune' parameters are:
+
+    * max_depth=1
+    * eta = 
+    * min_child_weight = 1
+    
+    
+Model Evaluation - visualize to compare the accuracy of all models
+```{r}
+plot(treeROC, col="#490092", lty=1)
+plot(forestROC, col ="#006DDB", lty=2, add=T)
+plot(adaROC, col="#B66DFF", lty=3, add=T)
+plot(xgbROC, col="#009292", lty=4, add=T)
+plot(xgbTuneROC, col="#FF6DB6", lty=5, add=T)
+abline(0,1)
+legend("bottomright", c("ctree", "forest", "ada", "xgb", "xgbTune"), col=c("#490092", "#006DDB", "#B66DFF", "#009292", "#FF6DB6"),
+        lty=c(1:5))
+
+treeAUC
+forestAUC
+adaAUC
+xgbAUC
+xgbTuneAUC
+```
+Conclusion: the best model here is xgbTuned
+
+
+### 7.6 Confusion Matrix
+Let's check out the confusion matrix of the best model
+```{r}
+PredictedClass <-  factor(ifelse(xgbTunePred > 0.3, "Yes", "No")) # Turn probabilities into factor
+PredictedClass <- relevel(PredictedClass, ref="Yes") #Reorder it so Yes is at the top
+Targets <- relevel(factor(test$hi_educ_inc),ref="Yes") # Get true outcomes as a factor
+ConfusionMatrix <- confusionMatrix(data=PredictedClass, reference = Targets, positive = "Yes") #Compare actual vs predicted
+
+ConfusionMatrix
+```
+Based on the confusion matrix if I was interested in class 0 (No) then this model is quite good, but if I want to predict class 1 (Yes) then I need to improvise the model.
+
+
+
+## 8 Dealing Class Imbalance
+Recall that we had around 85% in class 0 and 15% in class 1
+```{r}
+# Our train data 
+table(train$hi_educ_inc) # Count of No and Yes
+prop.table(table(train$hi_educ_inc)) # Proportion of No and Yes
+```
+
+
+We can deal with class imbalance by oversampling. 
+resource: https://www.r-bloggers.com/2016/12/handling-class-imbalance-with-r-and-caret-an-introduction/ 
+```{r}
+# Use same seed 
+tune_control$seeds <- xgb_tune$control$seeds
+
+# Build over-sampled model
+
+tune_control$sampling <- "up" # this is needed!!
+
+over_fit <- train %>%
+  caret::train(hi_educ_inc ~ .,
+             data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+overPred <- predict(over_fit, newdata=test, type="prob")[,2]
+overAUC <- getAUC(overPred, targets)
+overROC <- performance(prediction(overPred, targets), "tpr", "fpr")
+
+overAUC
+```
+Under sampling method
+```{r}
+tune_control$seeds <- xgb_tune$control$seeds
+# Build under-sampled data 
+tune_control$sampling <- "down"
+
+under_fit <- train %>%
+  caret::train(hi_educ_inc ~ .,
+             data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+underPred <- predict(under_fit, newdata=test, type="prob")[,2]
+underAUC <- getAUC(underPred, targets)
+underROC <- performance(prediction(underPred, targets), "tpr", "fpr")
+
+underAUC
+```
+
+The SMOTE method
+```{r}
+tune_control$seeds <- xgb_tune$control$seeds
+tune_control$sampling <- "smote"
+
+smote_fit <- train %>%
+  caret::train(hi_educ_inc ~ .,
+             data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+smotePred <- predict(smote_fit, newdata=test, type="prob")[,2]
+smoteAUC <- getAUC(smotePred, targets)
+smoteROC <- performance(prediction(smotePred, targets), "tpr", "fpr")
+
+smoteAUC
+```
+## 9 Model Evaluation
+
+Compare the accuracy of all models
+```{r}
+
+plot(treeROC, col="#4c6085", lty=1)
+plot(forestROC, col ="#39a0ed", lty=2, add=T)
+plot(adaROC, col="#36f1cd", lty=3, add=T)
+plot(xgbROC, col="#13c4a3", lty=4, add=T)
+plot(xgbTuneROC, col="#f7b32b", lty=5, add=T)
+plot(overROC, col ="#fe5f55", lty=6, add=T)
+plot(underROC, col ="#e4572e", lty=7, add=T)
+plot(smoteROC, col ="#1f1f1f", lty=8, add=T)
+abline(0,1)
+
+legend("bottomright", c("ctree", "forest", "ada", "xgb", "xgbTune", 
+                        "xgb OverFit", "xgb UnderFit", "xgbSmote"), 
+       
+       col=c("#4c6085", "#39a0ed", "#36f1cd", "#13c4a3", "#f7b32b", "#fe5f55", 
+             "#e4572e", "#1f1f1f" ),
+       lty=c(1:9))
+
+print("ClassTree")
+treeAUC
+
+print("Forest")
+forestAUC
+
+print("Ada")
+adaAUC
+
+print("XgBoost")
+xgbAUC
+
+print("XgBoost Tuned")
+xgbTuneAUC
+
+print("Over")
+overAUC
+
+print("Under")
+underAUC
+
+print("Smote")
+smoteAUC
+```
+
+### 9.1 Confusion Matrix
+```{r}
+#xgbTuned
+PredictedClass <-  factor(ifelse(xgbTunedPred > 0.4, "Yes", "No")) # Turn probabilities into factor
+PredictedClass <- relevel(PredictedClass, ref="Yes") #Reorder it so Yes is at the top
+Targets <- relevel(factor(test$hi_educ_inc),ref="Yes") # Get true outcomes as a factor
+ConfusionMatrix <- confusionMatrix(data=PredictedClass, reference = Targets, positive = "Yes") #Compare actual vs predicted
+
+ConfusionMatrix
+```
+
+
+```{r}
+#Smote
+PredictedClass3 <-  factor(ifelse(smotePred > 0.4, "Yes", "No")) # Turn probabilities into factor
+PredictedClass3 <- relevel(PredictedClass3, ref="Yes") #Reorder it so Yes is at the top
+Targets <- relevel(factor(test$hi_educ_inc),ref="Yes") # Get true outcomes as a factor
+ConfusionMatrix <- confusionMatrix(data=PredictedClass3, reference = Targets, positive = "Yes") #Compare actual vs predicted
+
+ConfusionMatrix
+```
+
+## 10 Household 3 Data
+
+Let's clean up household 3 data and deal with the missing values before running our predictions.
+```{r}
+print("Count of total missing values in h3 - ")
+sum(is.na(h3))
+```
+
+
+```{r}
+# Read & clean data function
+
+ h3_data_wrangled <- function(data = h3, seed = 2022){ # change data here to h3 for example to test
+   
+  # clean column names
+  data <- data %>% clean_names()
+  
+  # clean the dataset
+  data$age[which(data$age > 100)] <- NA
+  
+  # get the min for the purchase date and convert to NA if below
+  min <- quantile(data$purchdate, 0.0004, na.rm = TRUE)
+  data$purchdate[which(data$purchdate < min)] <- NA
+
+  # convert data to numeric to run correlations
+  cor_num <- select_if(data, is.numeric)
+ 
+  # calculate correlations
+  correlations <- cor(na.omit(cor_num))
+  
+  # plot correlations
+  corrplot(correlations, method = 'square', is.corr=FALSE, tl.cex = 0.7, tl.col="black", na.label=" ")
+  
+  
+  # impute missing data
+  set.seed(seed)
+  
+  imp_all <- mice(data, method = "cart", m = 1) # Impute data
+  imp_data <- complete(imp_all) # Store data 
+
+  summary(imp_data)
+  
+  # convert to a dataframe 
+  new_data <- as.data.frame(imp_data)
+  
+} 
+
+h3_wrangled <- h3_data_wrangled()
+```
+
+## -----------
+## CONCLUSION
+Which model should we use? 
+
+I saw that the xgbTuned Smote did the best in the leader board when testing with the household 2 data. Let's get predictions using XgbTuned Smote on household 3.
+
+### Cutoff Value
+```{r}
+cutoff <- 0.4
+```
+
+
+Running predictions on Household 3 using our chosen model (xgBoost SMOTE)
+```{r}
+# xgBoost SMOTE
+tune_control$seeds <- xgb_tune$control$seeds
+tune_control$sampling <- "smote"
+
+smote_fit <- all_wrangled %>%
+  caret::train(hi_educ_inc ~ .,
+             data = .,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+ChosenModelPred_H3 <- predict(smote_fit, newdata=h3_wrangled, type="prob")[,2]
+```
+
+
+### Final Submission 
+```{r}
+# Read in template the professor provided
+template <- read.csv("C:/Users/jenni/Documents/VillaNova University/04_Fall 2022/Data Mining_ML/02_Exams/Final Project/FinalSubmissionTemplate.csv")
+
+# Convert our predictions to 1 and 0 based on our cutoff value
+MarketTo <- ifelse(ChosenModelPred_H3 > cutoff, 1, 0)
+MarketTo[is.na(MarketTo)] <- 0
+
+# Insert predictions into the template file
+template$Prediction <- MarketTo
+template$TeamMemberNames  <- "Chris.Jenn.Nas.Savio.Will"
+
+template
+# Export predictions for submission
+write.table(template, "C:/Users/jenni/Documents/VillaNova University/04_Fall 2022/Data Mining_ML/02_Exams/Final Project/FinalSubmission.csv", row.names=F, sep=",")
+
+```
+
+
+
